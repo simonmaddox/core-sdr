@@ -289,7 +289,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
     }
 
     /// Human-readable IOReturn code (hex) for error messages.
-    private static func ioReturnDescription(_ status: IOReturn) -> String {
+    fileprivate static func ioReturnDescription(_ status: IOReturn) -> String {
         "IOReturn 0x" + String(format: "%08x", UInt32(bitPattern: status))
     }
 
@@ -360,13 +360,330 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
 
     // MARK: - USBTransport — bulk streaming (Task 3)
 
-    // TODO(Task 3): drive a fixed-depth ring of async bulk-IN reads on the interface pipe
-    // via `interface->ReadPipeAsync` and an async event source.
+    /// Continuous bulk-IN stream. Keeps `inFlight` `ReadPipeAsync` reads of `transferSize`
+    /// bytes outstanding on the pipe for `endpoint`; each completion yields its bytes and
+    /// re-submits a read on the same buffer, so the ring depth stays constant. Completions
+    /// are delivered on a dedicated `CFRunLoop` thread carrying the interface's async event
+    /// source. Terminating/cancelling the stream aborts the pipe and tears the thread down
+    /// (see `BulkReadContext`).
     func bulkStream(
         endpoint: UInt8, transferSize: Int, inFlight: Int
     ) -> AsyncThrowingStream<[UInt8], Error> {
         AsyncThrowingStream { continuation in
-            continuation.finish(throwing: SDRError.usb("bulkStream not implemented — Task 2/3"))
+            guard transferSize > 0 else {
+                continuation.finish(throwing: SDRError.usb("bulkStream: transferSize must be > 0"))
+                return
+            }
+            let depth = max(1, inFlight)
+
+            // --- Locate the bulk-IN pipe ref for `endpoint` (0x81 = IN, endpoint number 1). ---
+            let pipeRef: UInt8
+            do {
+                pipeRef = try Self.findBulkInPipe(interface: interface, endpoint: endpoint)
+            } catch {
+                continuation.finish(throwing: error)
+                return
+            }
+
+            // --- Create the interface's async event source (added to the ring thread's runloop). ---
+            var sourceRef: Unmanaged<CFRunLoopSource>?
+            let created = interface.pointee!.pointee.CreateInterfaceAsyncEventSource(interface, &sourceRef)
+            guard created == kIOReturnSuccess, let sourceRef else {
+                continuation.finish(throwing: SDRError.usb(
+                    "bulkStream: CreateInterfaceAsyncEventSource failed: \(Self.ioReturnDescription(created))"
+                ))
+                return
+            }
+            // `CreateInterfaceAsyncEventSource` returns a +1 source; hand ownership to ARC.
+            let source = sourceRef.takeRetainedValue()
+
+            let context = BulkReadContext(
+                interface: interface,
+                pipeRef: pipeRef,
+                transferSize: transferSize,
+                inFlight: depth,
+                source: source,
+                continuation: continuation
+            )
+            continuation.onTermination = { _ in context.stop() }
+            context.start()
         }
+    }
+
+    /// Finds the 1-based pipe ref on `interface` whose properties match a bulk-IN endpoint
+    /// with the endpoint number encoded in `endpoint` (low nibble; e.g. 0x81 → number 1).
+    private static func findBulkInPipe(
+        interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>,
+        endpoint: UInt8
+    ) throws -> UInt8 {
+        let wantNumber = UInt8(endpoint & 0x0F)
+
+        var numEndpoints: UInt8 = 0
+        let countResult = interface.pointee!.pointee.GetNumEndpoints(interface, &numEndpoints)
+        guard countResult == kIOReturnSuccess else {
+            throw SDRError.usb("bulkStream: GetNumEndpoints failed: \(ioReturnDescription(countResult))")
+        }
+
+        // Pipe refs are 1-based; pipe ref 0 is the default control pipe (EP0).
+        for pipeRef in 1...max(1, numEndpoints) where pipeRef <= numEndpoints {
+            var direction: UInt8 = 0
+            var number: UInt8 = 0
+            var transferType: UInt8 = 0
+            var maxPacketSize: UInt16 = 0
+            var interval: UInt8 = 0
+            let result = interface.pointee!.pointee.GetPipeProperties(
+                interface, pipeRef, &direction, &number, &transferType, &maxPacketSize, &interval
+            )
+            guard result == kIOReturnSuccess else { continue }
+            if direction == UInt8(kUSBIn), transferType == UInt8(kUSBBulk), number == wantNumber {
+                return pipeRef
+            }
+        }
+        throw SDRError.usb(
+            "bulkStream: no bulk-IN pipe for endpoint 0x\(String(endpoint, radix: 16))"
+        )
+    }
+}
+
+// MARK: - Bulk-IN read ring (IOUSBLib async)
+
+/// Per-slot heap buffer plus its owning context, handed to `ReadPipeAsync` as the `refcon`.
+///
+/// The C completion recovers the slot from the opaque `refcon` and re-submits a read on the
+/// same `buffer` (the ring). Slots are held strongly by `BulkReadContext.slots`; the cycle
+/// (context → slot → context) is broken explicitly in `cleanup()` on the run-loop thread.
+private final class BulkReadSlot {
+    let context: BulkReadContext
+    let buffer: UnsafeMutableRawPointer
+    init(context: BulkReadContext, buffer: UnsafeMutableRawPointer) {
+        self.context = context
+        self.buffer = buffer
+    }
+}
+
+/// C `IOAsyncCallback1` trampoline. Runs on the run-loop thread. Recovers the slot from the
+/// `refcon` and dispatches into the owning context. Non-capturing top-level function so it
+/// converts to a `@convention(c)` pointer for `ReadPipeAsync`.
+private func bulkReadCompletion(
+    _ refcon: UnsafeMutableRawPointer?, _ result: IOReturn, _ arg0: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    let slot = Unmanaged<BulkReadSlot>.fromOpaque(refcon).takeUnretainedValue()
+    slot.context.handle(slot: slot, result: result, arg0: arg0)
+}
+
+/// Drives one bulk-IN stream over IOUSBLib's async API: a fixed-depth ring of `ReadPipeAsync`
+/// requests whose completions are delivered on a dedicated `CFRunLoop` thread.
+///
+/// Concurrency: `@unchecked Sendable`. All `ReadPipeAsync` submissions and all completions run
+/// on the single run-loop thread; the consumer touches this object only via `stop()` (from
+/// `onTermination`, any thread). The mutable state (`stopped`, `runLoop`) is guarded by `lock`.
+/// The TOCTOU discipline mirrors `IOUSBHostTransport.BulkReader`: "check `stopped` → submit"
+/// is made atomic with "flip `stopped` → abort" by holding `lock` across both, so no
+/// `ReadPipeAsync` is ever submitted after `AbortPipe`.
+private final class BulkReadContext: @unchecked Sendable {
+    private let interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>
+    private let pipeRef: UInt8
+    private let transferSize: Int
+    private let inFlight: Int
+    private let source: CFRunLoopSource
+    private let continuation: AsyncThrowingStream<[UInt8], Error>.Continuation
+
+    private let lock = NSLock()
+    /// Once true, no new reads are submitted and completions are dropped. Guarded by `lock`.
+    private var stopped = false
+    /// The run loop the ring thread is servicing. `nil` until the thread stores it (or if the
+    /// thread observed `stopped` before starting). Guarded by `lock`.
+    private var runLoop: CFRunLoop?
+    /// Ring slots (each owns a heap buffer). Strong refs keep the slots — and their opaque
+    /// `refcon` pointers — alive while reads are outstanding. Only touched on the ring thread.
+    private var slots: [BulkReadSlot] = []
+
+    init(
+        interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>,
+        pipeRef: UInt8,
+        transferSize: Int,
+        inFlight: Int,
+        source: CFRunLoopSource,
+        continuation: AsyncThrowingStream<[UInt8], Error>.Continuation
+    ) {
+        self.interface = interface
+        self.pipeRef = pipeRef
+        self.transferSize = transferSize
+        self.inFlight = inFlight
+        self.source = source
+        self.continuation = continuation
+    }
+
+    /// Spawns the dedicated run-loop thread and starts servicing the ring.
+    func start() {
+        let thread = Thread { [self] in run() }
+        thread.name = "CoreSDR.IOUSBLib.bulkIn"
+        thread.stackSize = 512 * 1024
+        thread.start()
+    }
+
+    /// Body of the dedicated thread: add the async source, prime the ring, pump the run loop
+    /// until stopped, then tear everything down on this same thread.
+    private func run() {
+        let rl = CFRunLoopGetCurrent()!
+
+        lock.lock()
+        if stopped {
+            // `stop()` fired before the thread got going: skip running entirely.
+            lock.unlock()
+            cleanup()
+            return
+        }
+        runLoop = rl
+        CFRunLoopAddSource(rl, source, .defaultMode)
+        lock.unlock()
+
+        // Prime the ring with `inFlight` outstanding reads (each on its own heap buffer).
+        for _ in 0..<inFlight {
+            let buffer = UnsafeMutableRawPointer.allocate(
+                byteCount: transferSize, alignment: MemoryLayout<UInt8>.alignment
+            )
+            let slot = BulkReadSlot(context: self, buffer: buffer)
+            slots.append(slot)
+            if !submit(slot: slot) { break }
+        }
+
+        // Pump the run loop. A finite mode time bounds teardown latency and closes the
+        // "CFRunLoopStop delivered before CFRunLoopRun starts" race: even if a stop signal is
+        // lost, the loop re-checks `stopped` at most one interval later.
+        while true {
+            lock.lock()
+            let done = stopped
+            lock.unlock()
+            if done { break }
+            CFRunLoopRunInMode(.defaultMode, 0.2, false)
+        }
+
+        cleanup()
+    }
+
+    /// Submits one `ReadPipeAsync` on `slot.buffer`, atomically with the `stopped` check.
+    ///
+    /// Returns `false` if the read was not submitted (stopped, or a synchronous submit error —
+    /// which is recorded in `startupError` / finishes the stream). The `stopped` check and the
+    /// submission are performed together under `lock`, the same lock `stop()`/`finish()` hold
+    /// while flipping `stopped` and aborting the pipe, so a fresh read can never be submitted
+    /// after the abort.
+    @discardableResult
+    private func submit(slot: BulkReadSlot) -> Bool {
+        let refcon = Unmanaged.passUnretained(slot).toOpaque()
+        var submitError: IOReturn = kIOReturnSuccess
+
+        lock.lock()
+        if stopped {
+            lock.unlock()
+            return false
+        }
+        let result = interface.pointee!.pointee.ReadPipeAsync(
+            interface, pipeRef, slot.buffer, UInt32(transferSize), bulkReadCompletion, refcon
+        )
+        if result != kIOReturnSuccess {
+            submitError = result
+        }
+        lock.unlock()
+
+        if submitError != kIOReturnSuccess {
+            finish(with: SDRError.usb(
+                "bulkStream: ReadPipeAsync failed: \(IOUSBLibTransport.ioReturnDescription(submitError))"
+            ))
+            return false
+        }
+        return true
+    }
+
+    /// Handles one completed read (on the run-loop thread): yield its bytes and re-submit, or
+    /// map the failure. Mirrors `IOUSBHostTransport.BulkReader.handle`.
+    fileprivate func handle(slot: BulkReadSlot, result: IOReturn, arg0: UnsafeMutableRawPointer?) {
+        lock.lock()
+        let alreadyStopped = stopped
+        lock.unlock()
+        guard !alreadyStopped else { return }
+
+        switch result {
+        case kIOReturnSuccess:
+            // `arg0` carries the bytes-transferred count (see IOUSBLib ReadPipeAsync docs);
+            // extract it the way the libusb darwin backend does.
+            let transferred = Int(UInt32(truncatingIfNeeded: UInt(bitPattern: arg0)))
+            if transferred > 0 {
+                let count = min(transferred, transferSize)
+                // Copy out BEFORE re-submitting, since the read reuses the same buffer.
+                continuation.yield(Array(UnsafeRawBufferPointer(start: slot.buffer, count: count)))
+            }
+            submit(slot: slot)
+        case kIOReturnAborted:
+            // Expected once `stop()`/`finish()` has aborted the pipe; drop silently.
+            return
+        case kIOReturnNoDevice, kIOReturnNotResponding, kIOReturnNotAttached:
+            finish(with: SDRError.deviceDisconnected)
+        default:
+            finish(with: SDRError.usb(
+                "bulkStream: read failed: \(IOUSBLibTransport.ioReturnDescription(result))"
+            ))
+        }
+    }
+
+    /// Finishes the stream with an error and aborts the pipe. Idempotent. Called from a
+    /// completion on the run-loop thread; `AbortPipe` only requests cancellation (remaining
+    /// reads complete with `kIOReturnAborted` and are dropped), so it neither blocks nor
+    /// re-enters `handle`.
+    private func finish(with error: Error) {
+        lock.lock()
+        if stopped { lock.unlock(); return }
+        stopped = true
+        // Flip `stopped` and abort atomically under `lock` so no `submit` can slip a read in
+        // between the two.
+        _ = interface.pointee!.pointee.AbortPipe(interface, pipeRef)
+        let rl = runLoop
+        lock.unlock()
+
+        // `continuation.finish` is kept outside the lock (it may synchronously run the
+        // consumer's `onTermination`, i.e. `stop()`, which takes the same lock).
+        continuation.finish(throwing: error)
+        // Wake the run loop so it re-checks `stopped` and proceeds to teardown promptly.
+        if let rl { CFRunLoopStop(rl) }
+    }
+
+    /// Stops the ring and aborts the pipe. Invoked from `onTermination` (consumer cancelled or
+    /// broke out of the loop), on an arbitrary thread. Idempotent.
+    func stop() {
+        lock.lock()
+        if stopped { lock.unlock(); return }
+        stopped = true
+        // Same atomic flip+abort under `lock` as `finish()`, mutually exclusive with the
+        // check+submit in `submit(slot:)`.
+        _ = interface.pointee!.pointee.AbortPipe(interface, pipeRef)
+        let rl = runLoop
+        lock.unlock()
+
+        // If the thread has not stored its run loop yet, it will observe `stopped` before ever
+        // pumping and tear down immediately; otherwise stop the loop so it wakes now.
+        if let rl { CFRunLoopStop(rl) }
+    }
+
+    /// Tears down on the run-loop thread once the loop has stopped: at this point no completion
+    /// can be executing (they only run inside `CFRunLoopRunInMode` on this same thread) and the
+    /// pipe has been aborted, so freeing the buffers and releasing the source is safe.
+    private func cleanup() {
+        if let rl = runLoop {
+            CFRunLoopRemoveSource(rl, source, .defaultMode)
+        }
+        // `source` is ARC-managed (taken retained at creation); it releases when this context
+        // deallocates after the thread exits.
+
+        // Finish the stream in case teardown came from `stop()` (a completion-path failure
+        // already finished it; the continuation makes the second call a no-op).
+        continuation.finish()
+
+        for slot in slots {
+            slot.buffer.deallocate()
+        }
+        // Break the context <-> slot strong cycle so both deallocate once this thread exits.
+        slots.removeAll()
     }
 }
