@@ -23,8 +23,8 @@ enum USBDeviceMatching {
     static func matchingRTLServices() -> [io_service_t] {
         // Match the LEGACY `IOUSBDevice` class (`kIOUSBDeviceClassName`). The legacy
         // IOUSBFamily nub is the one from which an `IOUSBDeviceInterface` plug-in can be
-        // created via `IOCreatePlugInInterfaceForService`; the newer `IOUSBHostDevice`
-        // class is not compatible with the IOUSBLib COM API.
+        // created via `IOCreatePlugInInterfaceForService`; the newer host-class USB device
+        // nub is not compatible with the IOUSBLib COM API.
         //
         // `kIOUSBDeviceClassName` / `kUSBVendorID` / `kUSBProductID` are chained C
         // `#define` macros that do not import into Swift as usable constants, so we use

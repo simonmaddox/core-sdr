@@ -5,8 +5,8 @@ import IOKit.usb.IOUSBLib
 
 /// Real-hardware `USBTransport` backed by Apple's **legacy IOUSBLib** COM API.
 ///
-/// Unlike `IOUSBHost` (which requires a temporary-exception entitlement and is therefore
-/// not Mac App Store eligible), the legacy `IOUSBDeviceInterface` / `IOUSBInterfaceInterface`
+/// Unlike Apple's modern USB host framework (which requires a temporary-exception entitlement
+/// and is therefore not Mac App Store eligible), the legacy `IOUSBDeviceInterface` / `IOUSBInterfaceInterface`
 /// plug-ins are reachable from a sandboxed app holding only `com.apple.security.device.usb`.
 ///
 /// Task 1 implements discovery and the opening `init` only: it enumerates RTL-SDR dongles,
@@ -31,7 +31,7 @@ import IOKit.usb.IOUSBLib
 ///
 /// ## Concurrency
 /// `@unchecked Sendable`: the compiler cannot reason about the raw IOKit COM pointers. It is
-/// sound here for the same reason as `IOUSBHostTransport`: every stored handle is an
+/// sound here for the same reason IOKit COM transports generally are: every stored handle is an
 /// immutable `let` assigned once in `init` and never mutated afterwards. The underlying
 /// IOUSBLib device/interface objects are internally serialised by IOUSBFamily. The transfer
 /// methods added in Tasks 2-3 introduce their own synchronisation for any in-flight state.
@@ -478,7 +478,7 @@ private func bulkReadCompletion(
 /// Concurrency: `@unchecked Sendable`. All `ReadPipeAsync` submissions and all completions run
 /// on the single run-loop thread; the consumer touches this object only via `stop()` (from
 /// `onTermination`, any thread). The mutable state (`stopped`, `runLoop`) is guarded by `lock`.
-/// The TOCTOU discipline mirrors `IOUSBHostTransport.BulkReader`: "check `stopped` → submit"
+/// The TOCTOU discipline is "check `stopped` → submit"
 /// is made atomic with "flip `stopped` → abort" by holding `lock` across both, so no
 /// `ReadPipeAsync` is ever submitted after `AbortPipe`.
 private final class BulkReadContext: @unchecked Sendable {
@@ -598,7 +598,7 @@ private final class BulkReadContext: @unchecked Sendable {
     }
 
     /// Handles one completed read (on the run-loop thread): yield its bytes and re-submit, or
-    /// map the failure. Mirrors `IOUSBHostTransport.BulkReader.handle`.
+    /// map the failure.
     fileprivate func handle(slot: BulkReadSlot, result: IOReturn, arg0: UnsafeMutableRawPointer?) {
         lock.lock()
         let alreadyStopped = stopped

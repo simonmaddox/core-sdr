@@ -20,7 +20,7 @@ public actor SDRDevice {
 
     /// Test/discovery seam: construct directly over any `USBTransport` and
     /// descriptive `info`. `public static discover()`/`default` (added in a
-    /// later task) call this with the real IOUSBHost-backed transport.
+    /// later task) call this with the real IOUSBLib-backed transport.
     init(transport: any USBTransport, info: SDRDeviceInfo) {
         self.device = RTLSDRDevice(transport: transport)
         self.info = info
@@ -105,11 +105,11 @@ public actor SDRDevice {
 extension SDRDevice {
     /// Enumerates attached RTL-SDR dongles without opening any of them.
     ///
-    /// Wraps `IOUSBHostTransport.discover()`, keeping only the descriptive
+    /// Wraps `IOUSBLibTransport.discover()`, keeping only the descriptive
     /// `SDRDeviceInfo` for each match and releasing the `io_service_t` handles
     /// (which `discover()` transfers to us) so none leak.
     public static func discover() async throws -> [SDRDeviceInfo] {
-        let matches = try IOUSBHostTransport.discover()
+        let matches = try IOUSBLibTransport.discover()
         defer { for match in matches { IOObjectRelease(match.service) } }
         return matches.map(\.info)
     }
@@ -121,12 +121,12 @@ extension SDRDevice {
     /// after building the transport (which retains its own reference).
     public static var `default`: SDRDevice {
         get async throws {
-            let matches = try IOUSBHostTransport.discover()
+            let matches = try IOUSBLibTransport.discover()
             defer { for match in matches { IOObjectRelease(match.service) } }
             guard let selected = matches.first else {
                 throw SDRError.deviceNotFound
             }
-            let transport = try IOUSBHostTransport(service: selected.service)
+            let transport = try IOUSBLibTransport(service: selected.service)
             let device = SDRDevice(transport: transport, info: selected.info)
             try await device.open()
             return device
@@ -139,12 +139,12 @@ extension SDRDevice {
     /// used instead. Throws `SDRError.deviceNotFound` if the id is no longer
     /// present. All service handles are released once the transport is built.
     public static func open(_ info: SDRDeviceInfo) async throws -> SDRDevice {
-        let matches = try IOUSBHostTransport.discover()
+        let matches = try IOUSBLibTransport.discover()
         defer { for match in matches { IOObjectRelease(match.service) } }
         guard let selected = matches.first(where: { $0.info.id == info.id }) else {
             throw SDRError.deviceNotFound
         }
-        let transport = try IOUSBHostTransport(service: selected.service)
+        let transport = try IOUSBLibTransport(service: selected.service)
         let device = SDRDevice(transport: transport, info: selected.info)
         try await device.open()
         return device
