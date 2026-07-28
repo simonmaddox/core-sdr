@@ -24,10 +24,11 @@ import IOKit.usb.IOUSBLib
 /// The UUID constants (`kIOUSBDeviceUserClientTypeID`, `kIOCFPlugInInterfaceID`,
 /// `kIOUSBDeviceInterfaceID`, …) are function-like `CFUUIDGetConstantUUIDWithBytes(…)` macros
 /// that do not import into Swift, so they are reconstructed from their documented byte
-/// values (see `IOUSBLib.h` / `IOCFPlugIn.h`). We request the `…942` interface UUIDs because
-/// Swift's `IOUSBDeviceInterface` / `IOUSBInterfaceInterface` typedefs resolve to the newest
-/// `…942` struct layout — matching the requested UUID to the Swift v-table type keeps every
-/// member access in-bounds.
+/// values (see `IOUSBLib.h` / `IOCFPlugIn.h`). We request the `…942` interface UUIDs. Swift
+/// imports `IOUSBDeviceInterface` / `IOUSBInterfaceInterface` as the base struct types, and
+/// COM v-tables are append-only, so the `…942` handle exposes the same base-member offsets we
+/// call (`QueryInterface`, `USBDeviceOpen`, `CreateInterfaceIterator`, `ReadPipeAsync`, …). We
+/// touch no version-`942`-only member, so every access stays in-bounds.
 ///
 /// ## Concurrency
 /// `@unchecked Sendable`: the compiler cannot reason about the raw IOKit COM pointers. It is
@@ -565,8 +566,8 @@ private final class BulkReadContext: @unchecked Sendable {
 
     /// Submits one `ReadPipeAsync` on `slot.buffer`, atomically with the `stopped` check.
     ///
-    /// Returns `false` if the read was not submitted (stopped, or a synchronous submit error —
-    /// which is recorded in `startupError` / finishes the stream). The `stopped` check and the
+    /// Returns `false` if the read was not submitted (stopped, or a synchronous submit error
+    /// recorded in `submitError`, which finishes the stream). The `stopped` check and the
     /// submission are performed together under `lock`, the same lock `stop()`/`finish()` hold
     /// while flipping `stopped` and aborting the pipe, so a fresh read can never be submitted
     /// after the abort.
