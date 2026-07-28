@@ -18,13 +18,18 @@ enum USBDeviceMatching {
     /// Ownership: each returned service carries a retain (they come from
     /// `IOIteratorNext`). The **caller owns** these references and must balance each
     /// one with `IOObjectRelease` once finished (or hand it to
-    /// `IOUSBHostTransport(service:)`, which retains its own reference internally).
+    /// `IOUSBLibTransport(service:)`, which retains its own reference internally).
     /// The iterator created here is released before returning.
     static func matchingRTLServices() -> [io_service_t] {
-        // `kIOUSBHostDeviceClassName` / `kUSBVendorID` / `kUSBProductID` are chained C
+        // Match the LEGACY `IOUSBDevice` class (`kIOUSBDeviceClassName`). The legacy
+        // IOUSBFamily nub is the one from which an `IOUSBDeviceInterface` plug-in can be
+        // created via `IOCreatePlugInInterfaceForService`; the newer `IOUSBHostDevice`
+        // class is not compatible with the IOUSBLib COM API.
+        //
+        // `kIOUSBDeviceClassName` / `kUSBVendorID` / `kUSBProductID` are chained C
         // `#define` macros that do not import into Swift as usable constants, so we use
-        // their documented literal values ("IOUSBHostDevice", "idVendor", "idProduct").
-        guard let matching = IOServiceMatching("IOUSBHostDevice") as NSMutableDictionary? else {
+        // their documented literal values ("IOUSBDevice", "idVendor", "idProduct").
+        guard let matching = IOServiceMatching("IOUSBDevice") as NSMutableDictionary? else {
             return []
         }
         matching["idVendor"] = rtlVendorID
