@@ -295,15 +295,67 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
 
     // MARK: - USBTransport — control transfers (Task 2)
 
-    // TODO(Task 2): issue the control transfer on EP0 via
-    // `device->DeviceRequest` / `device->DeviceRequestAsync`.
+    /// Control OUT on EP0: sends `data` to the device.
+    ///
+    /// `DeviceRequest` is a synchronous (blocking) control transfer, so it is issued
+    /// directly inside this `async` method — there is no async IOUSBLib form worth a
+    /// continuation for a few bytes of register I/O. The direction (`kUSBOut`, 0x40) is
+    /// already encoded in `request.requestType`; it is passed through verbatim as
+    /// `bmRequestType`.
     func controlWrite(_ request: USBControlRequest, data: [UInt8]) async throws {
-        throw SDRError.usb("controlWrite not implemented — Task 2/3")
+        // A mutable copy keeps the data-phase buffer alive across the DeviceRequest call
+        // (`pData` points into it). `withUnsafeMutableBufferPointer` guarantees the storage
+        // does not move for the duration of the closure.
+        var buffer = data
+        try buffer.withUnsafeMutableBufferPointer { ptr in
+            var req = IOUSBDevRequest()
+            req.bmRequestType = request.requestType
+            req.bRequest = request.request
+            req.wValue = request.value
+            req.wIndex = request.index
+            req.wLength = UInt16(clamping: data.count)
+            req.pData = ptr.baseAddress.map(UnsafeMutableRawPointer.init)
+            req.wLenDone = 0
+
+            let result = device.pointee!.pointee.DeviceRequest(device, &req)
+            guard result == kIOReturnSuccess else {
+                throw SDRError.usb(
+                    "control write (DeviceRequest) failed: \(Self.ioReturnDescription(result))"
+                )
+            }
+        }
     }
 
-    // TODO(Task 2): issue the control IN transfer on EP0 and return the data phase.
+    /// Control IN on EP0: reads up to `length` bytes and returns exactly the bytes the
+    /// device transferred (`wLenDone`), which may be shorter than `length`.
+    ///
+    /// The direction (`kUSBIn`, 0xC0) is already encoded in `request.requestType` and
+    /// passed through as `bmRequestType`.
     func controlRead(_ request: USBControlRequest, length: Int) async throws -> [UInt8] {
-        throw SDRError.usb("controlRead not implemented — Task 2/3")
+        guard length > 0 else { return [] }
+
+        // Data-phase buffer; `pData` points into it and it must outlive the blocking call.
+        var buffer = [UInt8](repeating: 0, count: length)
+        let transferred: Int = try buffer.withUnsafeMutableBufferPointer { ptr in
+            var req = IOUSBDevRequest()
+            req.bmRequestType = request.requestType
+            req.bRequest = request.request
+            req.wValue = request.value
+            req.wIndex = request.index
+            req.wLength = UInt16(clamping: length)
+            req.pData = UnsafeMutableRawPointer(ptr.baseAddress)
+            req.wLenDone = 0
+
+            let result = device.pointee!.pointee.DeviceRequest(device, &req)
+            guard result == kIOReturnSuccess else {
+                throw SDRError.usb(
+                    "control read (DeviceRequest) failed: \(Self.ioReturnDescription(result))"
+                )
+            }
+            // `wLenDone` is the actual data-phase length; clamp to the buffer for safety.
+            return min(Int(req.wLenDone), ptr.count)
+        }
+        return Array(buffer.prefix(transferred))
     }
 
     // MARK: - USBTransport — bulk streaming (Task 3)
