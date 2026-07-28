@@ -1,0 +1,132 @@
+{
+  "setFreq": [
+    {
+      "hz": 100000000,
+      "writes": [
+        { "reg": 23, "value": 48 },
+        { "reg": 26, "value": 42 },
+        { "reg": 27, "value": 52 },
+        { "reg": 16, "value": 132 },
+        { "reg": 16, "value": 132 },
+        { "reg": 26, "value": 34 },
+        { "reg": 16, "value": 132 },
+        { "reg": 20, "value": 11 },
+        { "reg": 18, "value": 128 },
+        { "reg": 22, "value": 137 },
+        { "reg": 21, "value": 245 },
+        { "reg": 26, "value": 42 }
+      ]
+    },
+    {
+      "hz": 173225000,
+      "writes": [
+        { "reg": 23, "value": 48 },
+        { "reg": 26, "value": 42 },
+        { "reg": 27, "value": 20 },
+        { "reg": 16, "value": 132 },
+        { "reg": 16, "value": 132 },
+        { "reg": 26, "value": 34 },
+        { "reg": 16, "value": 100 },
+        { "reg": 20, "value": 9 },
+        { "reg": 18, "value": 128 },
+        { "reg": 22, "value": 28 },
+        { "reg": 21, "value": 23 },
+        { "reg": 26, "value": 42 }
+      ]
+    },
+    {
+      "hz": 433920000,
+      "writes": [
+        { "reg": 23, "value": 48 },
+        { "reg": 26, "value": 105 },
+        { "reg": 27, "value": 0 },
+        { "reg": 16, "value": 132 },
+        { "reg": 16, "value": 132 },
+        { "reg": 26, "value": 97 },
+        { "reg": 16, "value": 68 },
+        { "reg": 20, "value": 203 },
+        { "reg": 18, "value": 128 },
+        { "reg": 22, "value": 195 },
+        { "reg": 21, "value": 51 },
+        { "reg": 26, "value": 105 }
+      ]
+    },
+    {
+      "hz": 868000000,
+      "writes": [
+        { "reg": 23, "value": 48 },
+        { "reg": 26, "value": 104 },
+        { "reg": 27, "value": 0 },
+        { "reg": 16, "value": 132 },
+        { "reg": 16, "value": 132 },
+        { "reg": 26, "value": 96 },
+        { "reg": 16, "value": 36 },
+        { "reg": 20, "value": 203 },
+        { "reg": 18, "value": 128 },
+        { "reg": 22, "value": 134 },
+        { "reg": 21, "value": 148 },
+        { "reg": 26, "value": 104 }
+      ]
+    },
+    {
+      "hz": 1090000000,
+      "writes": [
+        { "reg": 23, "value": 48 },
+        { "reg": 26, "value": 104 },
+        { "reg": 27, "value": 0 },
+        { "reg": 16, "value": 132 },
+        { "reg": 16, "value": 132 },
+        { "reg": 26, "value": 96 },
+        { "reg": 16, "value": 4 },
+        { "reg": 20, "value": 6 },
+        { "reg": 18, "value": 128 },
+        { "reg": 22, "value": 248 },
+        { "reg": 21, "value": 159 },
+        { "reg": 26, "value": 104 }
+      ]
+    }
+  ],
+  "setGain": [
+    {
+      "tenthsDb": 0,
+      "mode": "manual",
+      "writes": [
+        { "reg": 5, "value": 144 },
+        { "reg": 7, "value": 96 },
+        { "reg": 5, "value": 144 },
+        { "reg": 7, "value": 96 },
+        { "reg": 12, "value": 240 }
+      ]
+    },
+    {
+      "tenthsDb": 166,
+      "mode": "manual",
+      "writes": [
+        { "reg": 5, "value": 144 },
+        { "reg": 7, "value": 96 },
+        { "reg": 5, "value": 149 },
+        { "reg": 7, "value": 101 },
+        { "reg": 12, "value": 240 }
+      ]
+    },
+    {
+      "tenthsDb": 328,
+      "mode": "manual",
+      "writes": [
+        { "reg": 5, "value": 144 },
+        { "reg": 7, "value": 96 },
+        { "reg": 5, "value": 153 },
+        { "reg": 7, "value": 104 },
+        { "reg": 12, "value": 240 }
+      ]
+    },
+    {
+      "mode": "auto",
+      "writes": [
+        { "reg": 5, "value": 128 },
+        { "reg": 7, "value": 112 },
+        { "reg": 12, "value": 240 }
+      ]
+    }
+  ]
+}

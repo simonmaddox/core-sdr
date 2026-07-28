@@ -130,7 +130,7 @@ public struct IQBlock: Sendable {
     public let centerFrequency: Frequency
     public let sequence: UInt64      // monotonic; gaps indicate dropped blocks
     public let hostTimestamp: UInt64 // mach_absolute_time at capture
-    public func normalized() -> [Float]  // interleaved Float32 in [-1, 1), via vDSP, on demand
+    public func normalized() -> [Float]  // interleaved Float32 in [-1, 1], via vDSP, on demand
 }
 
 public enum SDRError: Error, Sendable {
