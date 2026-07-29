@@ -3,10 +3,10 @@
 A native, dependency-free Swift package for using RTL-SDR software-defined
 radio dongles on macOS.
 
-CoreSDR talks to the hardware directly over Apple's `IOUSBHost` stack, using
-only Apple system frameworks. It implements the RTL2832U + R820T2 USB protocol
-in Swift, from control transfers up through a live, backpressure-aware IQ
-sample stream.
+CoreSDR talks to the hardware directly through Apple's `IOUSBLib`, using only
+Apple system frameworks. It implements the RTL2832U + R820T2 USB protocol in
+Swift, from control transfers up through a live, backpressure-aware IQ sample
+stream.
 
 CoreSDR is **hardware I/O only**: device discovery, tuning, gain, sample
 rate, and a stream of raw IQ blocks. DSP (FFT, filtering, demodulation) and
@@ -37,7 +37,7 @@ Add CoreSDR via Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.0.0"),
+    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.1.0"),
 ]
 ```
 
@@ -97,15 +97,40 @@ The device presents as a vendor-specific USB device with no Apple kernel
 driver claiming it, so user-space access works with no DriverKit, kext, or
 elevated privileges required.
 
-## Sandbox note
+## Why IOUSBLib (and the App Sandbox)
 
-CoreSDR itself requires no entitlement. If you ship a sandboxed Mac App
-Store app that links CoreSDR, add the USB entitlement to *your app*:
+CoreSDR itself requires no entitlement. If you ship a sandboxed app that links
+CoreSDR, including a Mac App Store app, add the USB entitlement to *your app*:
 
 ```xml
 <key>com.apple.security.device.usb</key>
 <true/>
 ```
+
+That single entitlement is all you need, and the choice of USB stack is what
+makes that possible.
+
+`com.apple.security.device.usb` grants a sandboxed app access to the legacy
+IOKit USB user clients (`IOUSBDeviceUserClientV2` and
+`IOUSBInterfaceUserClientV3`), which are exactly the clients `IOUSBLib` opens.
+It does *not* cover `IOUSBHost.framework`'s user clients
+(`AppleUSBHostFrameworkDeviceClient` and its interface client). Reaching those
+from a sandbox requires a
+`com.apple.security.temporary-exception.iokit-user-client-class` entitlement,
+and the Mac App Store does not accept temporary-exception entitlements. So an
+`IOUSBHost`-based transport cannot ship on the Mac App Store with only the
+public USB entitlement.
+
+CoreSDR therefore uses `IOUSBLib`. A sandboxed app, Mac App Store included,
+reaches the RTL-SDR with just `com.apple.security.device.usb` and no
+temporary-exception. This was verified empirically: a signed, sandboxed app
+carrying only `device.usb` opened the dongle through CoreSDR, and removing the
+entitlement caused the open to be denied.
+
+`IOUSBLib` is a deprecated-but-supported IOKit API (it's the same USB path
+libusb uses on macOS). It works both sandboxed and non-sandboxed, and the
+internal `USBTransport` seam keeps an `IOUSBHost` transport re-addable later if
+a future device ever needs it.
 
 ## `coresdr-demo`
 
