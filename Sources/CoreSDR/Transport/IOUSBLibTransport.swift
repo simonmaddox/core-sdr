@@ -499,6 +499,12 @@ private final class BulkReadContext: @unchecked Sendable {
     /// Ring slots (each owns a heap buffer). Strong refs keep the slots — and their opaque
     /// `refcon` pointers — alive while reads are outstanding. Only touched on the ring thread.
     private var slots: [BulkReadSlot] = []
+    /// Number of `ReadPipeAsync` reads currently in flight in the kernel (submitted, completion
+    /// not yet delivered). Guarded by `lock`. Teardown must not free the slots/buffers until this
+    /// reaches zero: `AbortPipe` completes outstanding reads with `kIOReturnAborted`
+    /// *asynchronously* via the run-loop source, so freeing before those completions drain leaves
+    /// the kernel writing into — and a late `bulkReadCompletion` dereferencing — freed memory.
+    private var outstanding = 0
 
     init(
         interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>,
@@ -561,6 +567,23 @@ private final class BulkReadContext: @unchecked Sendable {
             CFRunLoopRunInMode(.defaultMode, 0.2, false)
         }
 
+        // Drain before freeing. `stop()`/`finish()` aborted the pipe, but the aborted reads'
+        // completions are delivered asynchronously via the run-loop source and may still be
+        // queued. Keep servicing the run loop until every outstanding read has completed, so
+        // `cleanup()` never frees a buffer the kernel could still write into — or a slot a late
+        // `bulkReadCompletion` could dereference (the Stop→restart use-after-free). A bounded
+        // backstop (far longer than an aborted transfer takes to report) prevents any hang if a
+        // completion is somehow never delivered.
+        var drainSpins = 0
+        while true {
+            lock.lock()
+            let remaining = outstanding
+            lock.unlock()
+            if remaining <= 0 || drainSpins >= 50 { break }
+            drainSpins += 1
+            CFRunLoopRunInMode(.defaultMode, 0.2, false)
+        }
+
         cleanup()
     }
 
@@ -584,7 +607,9 @@ private final class BulkReadContext: @unchecked Sendable {
         let result = interface.pointee!.pointee.ReadPipeAsync(
             interface, pipeRef, slot.buffer, UInt32(transferSize), bulkReadCompletion, refcon
         )
-        if result != kIOReturnSuccess {
+        if result == kIOReturnSuccess {
+            outstanding += 1   // in flight until its completion is delivered
+        } else {
             submitError = result
         }
         lock.unlock()
@@ -602,9 +627,19 @@ private final class BulkReadContext: @unchecked Sendable {
     /// map the failure.
     fileprivate func handle(slot: BulkReadSlot, result: IOReturn, arg0: UnsafeMutableRawPointer?) {
         lock.lock()
+        outstanding -= 1                 // this read is no longer in flight
         let alreadyStopped = stopped
+        let remaining = outstanding
+        let rl = runLoop
         lock.unlock()
-        guard !alreadyStopped else { return }
+
+        // Draining after a stop/abort: don't yield or re-submit. Once the last outstanding read
+        // has drained, wake the run loop so `run()` proceeds to `cleanup()` promptly (rather than
+        // waiting out the poll interval).
+        guard !alreadyStopped else {
+            if remaining == 0, let rl { CFRunLoopStop(rl) }
+            return
+        }
 
         switch result {
         case kIOReturnSuccess:
@@ -667,9 +702,10 @@ private final class BulkReadContext: @unchecked Sendable {
         if let rl { CFRunLoopStop(rl) }
     }
 
-    /// Tears down on the run-loop thread once the loop has stopped: at this point no completion
-    /// can be executing (they only run inside `CFRunLoopRunInMode` on this same thread) and the
-    /// pipe has been aborted, so freeing the buffers and releasing the source is safe.
+    /// Tears down on the run-loop thread once the loop has stopped AND all outstanding reads have
+    /// drained (see `run()`'s drain loop): at this point no completion is pending or executing —
+    /// they only run inside `CFRunLoopRunInMode` on this same thread, and `outstanding` is zero —
+    /// so freeing the buffers and releasing the source is safe.
     private func cleanup() {
         if let rl = runLoop {
             CFRunLoopRemoveSource(rl, source, .defaultMode)
