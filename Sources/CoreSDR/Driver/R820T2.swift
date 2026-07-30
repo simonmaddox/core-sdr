@@ -24,10 +24,10 @@ import Foundation
 /// reason.
 ///
 /// `@unchecked Sendable`: the compiler can't verify the manual locking, so all
-/// property access goes through `lock`. The read-modify-write register
-/// sequences that thread this state are serialized by the owning `SDRDevice`
-/// actor, matching the single-caller assumption the reference driver makes of
-/// `priv->regs`.
+/// property access goes through `lock`. `SDRDevice` additionally serializes the
+/// tuner's read-modify-write register sequences through its hardware-operation
+/// queue, so they run one at a time — matching the single-caller assumption the
+/// reference driver makes of `priv->regs`.
 private final class TunerRegisterState: @unchecked Sendable {
     private let lock = NSLock()
     private var _shadow: [UInt8]

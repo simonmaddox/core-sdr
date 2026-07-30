@@ -9,11 +9,11 @@ import IOKit.usb.IOUSBLib
 /// and is therefore not Mac App Store eligible), the legacy `IOUSBDeviceInterface` / `IOUSBInterfaceInterface`
 /// plug-ins are reachable from a sandboxed app holding only `com.apple.security.device.usb`.
 ///
-/// Task 1 implements discovery and the opening `init` only: it enumerates RTL-SDR dongles,
-/// builds `SDRDeviceInfo`, opens the `IOUSBDeviceInterface`, and claims interface 0 as an
-/// `IOUSBInterfaceInterface`. The three `USBTransport` transfer methods
-/// (`controlWrite` / `controlRead` / `bulkStream`) are filled in by Tasks 2-3 and are
-/// throwing stubs here.
+/// Discovery and the opening `init` enumerate RTL-SDR dongles, build `SDRDeviceInfo`, open the
+/// `IOUSBDeviceInterface`, and claim interface 0 as an `IOUSBInterfaceInterface`. The three
+/// `USBTransport` transfer methods are implemented on top of that handle: `controlWrite` /
+/// `controlRead` issue blocking timed EP0 `DeviceRequestTO`s, and `bulkStream` runs a
+/// fixed-depth async `ReadPipeAsync` ring on a dedicated run-loop thread (see `BulkReadContext`).
 ///
 /// ## IOUSBLib COM interop
 /// All `(*iface)->Method(iface, …)` C-style COM calls are quarantined to this file. In Swift
@@ -35,13 +35,22 @@ import IOKit.usb.IOUSBLib
 /// sound here for the same reason IOKit COM transports generally are: every stored handle is an
 /// immutable `let` assigned once in `init` and never mutated afterwards. The underlying
 /// IOUSBLib device/interface objects are internally serialised by IOUSBFamily. The transfer
-/// methods added in Tasks 2-3 introduce their own synchronisation for any in-flight state.
+/// methods introduce their own synchronisation for any in-flight state.
 final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
 
     /// Doubly-indirected handle to the opened `IOUSBDeviceInterface` COM object.
     private let device: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>
     /// Doubly-indirected handle to interface 0's `IOUSBInterfaceInterface` COM object.
     private let interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>
+
+    /// Serialises successive bulk-read rings on the shared pipe. Holds the most recently
+    /// created ring's teardown signal; the next `bulkStream` hands it to the new ring, which
+    /// blocks until the previous ring has fully aborted and drained before priming its own
+    /// reads. Without this a restart's fresh reads are submitted while the old ring's
+    /// `AbortPipe` is still in flight — the abort kills them too, and the stream silently
+    /// yields nothing. Guarded by `ringLock`.
+    private let ringLock = NSLock()
+    private var previousRingTeardown: DispatchSemaphore?
 
     // MARK: - COM UUIDs (reconstructed from IOUSBLib.h / IOCFPlugIn.h byte values)
 
@@ -116,7 +125,9 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
 
     /// Builds `SDRDeviceInfo` from IORegistry properties without opening the device.
     private static func deviceInfo(for service: io_service_t) -> SDRDeviceInfo {
-        // Stable per-physical-port identifier from the IOKit registry entry ID.
+        // Identifier derived from the IOKit registry entry ID. It is stable only while the
+        // device stays attached: the kernel assigns a fresh entry ID on every (re)enumeration,
+        // so unplugging and replugging the same dongle yields a different id.
         var entryID: UInt64 = 0
         let id: String
         if IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS {
@@ -174,7 +185,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         let openResult = device.pointee!.pointee.USBDeviceOpen(device)
         guard openResult == kIOReturnSuccess else {
             _ = device.pointee!.pointee.Release(device)
-            throw SDRError.usb("USBDeviceOpen failed: \(Self.ioReturnDescription(openResult))")
+            throw SDRError.usb(openResult, "USBDeviceOpen failed")
         }
 
         // --- First interface's io_service_t ---
@@ -209,7 +220,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             _ = interface.pointee!.pointee.Release(interface)
             _ = device.pointee!.pointee.USBDeviceClose(device)
             _ = device.pointee!.pointee.Release(device)
-            throw SDRError.usb("USBInterfaceOpen failed: \(Self.ioReturnDescription(interfaceOpen))")
+            throw SDRError.usb(interfaceOpen, "USBInterfaceOpen failed")
         }
 
         self.device = device
@@ -242,9 +253,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             service, userClientType, plugInInterfaceID, &plugIn, &score
         )
         guard created == kIOReturnSuccess, let plugIn else {
-            throw SDRError.usb(
-                "IOCreatePlugInInterfaceForService(\(what)) failed: \(ioReturnDescription(created))"
-            )
+            throw SDRError.usb(created, "IOCreatePlugInInterfaceForService(\(what)) failed")
         }
         defer { _ = plugIn.pointee!.pointee.Release(plugIn) }
 
@@ -255,10 +264,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             &raw
         )
         guard queried == 0, let raw else {
-            throw SDRError.usb(
-                "QueryInterface(\(what)) failed: hr=0x"
-                    + String(format: "%08x", UInt32(bitPattern: queried))
-            )
+            throw SDRError.usb(queried, "QueryInterface(\(what)) failed")
         }
         // `raw`'s pointer value *is* the `T**` COM handle; reinterpret its bit pattern.
         return raw.assumingMemoryBound(to: UnsafeMutablePointer<T>?.self)
@@ -278,7 +284,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         var iterator: io_iterator_t = IO_OBJECT_NULL
         let result = device.pointee!.pointee.CreateInterfaceIterator(device, &request, &iterator)
         guard result == kIOReturnSuccess, iterator != IO_OBJECT_NULL else {
-            throw SDRError.usb("CreateInterfaceIterator failed: \(ioReturnDescription(result))")
+            throw SDRError.usb(result, "CreateInterfaceIterator failed")
         }
         defer { IOObjectRelease(iterator) }
 
@@ -289,19 +295,22 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         return interfaceService
     }
 
-    /// Human-readable IOReturn code (hex) for error messages.
-    fileprivate static func ioReturnDescription(_ status: IOReturn) -> String {
-        "IOReturn 0x" + String(format: "%08x", UInt32(bitPattern: status))
-    }
+    // MARK: - USBTransport — control transfers
 
-    // MARK: - USBTransport — control transfers (Task 2)
+    /// Per-transfer EP0 timeout (milliseconds), applied to both the data and completion
+    /// phases. Bounds a wedged control transfer so it can never park a cooperative-pool
+    /// thread — and thereby the owning `SDRDevice` actor — indefinitely. One second is
+    /// generous for the few-byte register I/O these transfers carry (which normally
+    /// complete in well under a millisecond) while still failing promptly on a dead dongle.
+    private static let controlTimeoutMs: UInt32 = 1000
 
     /// Control OUT on EP0: sends `data` to the device.
     ///
-    /// `DeviceRequest` is a synchronous (blocking) control transfer, so it is issued
-    /// directly inside this `async` method — there is no async IOUSBLib form worth a
-    /// continuation for a few bytes of register I/O. The direction (`kUSBOut`, 0x40) is
-    /// already encoded in `request.requestType`; it is passed through verbatim as
+    /// Uses the timed, blocking `DeviceRequestTO` form so a stalled/unresponsive dongle
+    /// fails with `kIOReturnTimeout` rather than blocking forever (an untimed `DeviceRequest`
+    /// would wedge the calling cooperative-pool thread). There is no async IOUSBLib form
+    /// worth a continuation for a few bytes of register I/O. The direction (`kUSBOut`, 0x40)
+    /// is already encoded in `request.requestType`; it is passed through verbatim as
     /// `bmRequestType`.
     func controlWrite(_ request: USBControlRequest, data: [UInt8]) async throws {
         // A mutable copy keeps the data-phase buffer alive across the DeviceRequest call
@@ -309,7 +318,7 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         // does not move for the duration of the closure.
         var buffer = data
         try buffer.withUnsafeMutableBufferPointer { ptr in
-            var req = IOUSBDevRequest()
+            var req = IOUSBDevRequestTO()
             req.bmRequestType = request.requestType
             req.bRequest = request.request
             req.wValue = request.value
@@ -317,12 +326,12 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             req.wLength = UInt16(clamping: data.count)
             req.pData = ptr.baseAddress.map(UnsafeMutableRawPointer.init)
             req.wLenDone = 0
+            req.noDataTimeout = Self.controlTimeoutMs
+            req.completionTimeout = Self.controlTimeoutMs
 
-            let result = device.pointee!.pointee.DeviceRequest(device, &req)
+            let result = Self.deviceRequestTO(device, &req)
             guard result == kIOReturnSuccess else {
-                throw SDRError.usb(
-                    "control write (DeviceRequest) failed: \(Self.ioReturnDescription(result))"
-                )
+                throw SDRError.usb(result, "control write (DeviceRequestTO) failed")
             }
         }
     }
@@ -330,15 +339,15 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
     /// Control IN on EP0: reads up to `length` bytes and returns exactly the bytes the
     /// device transferred (`wLenDone`), which may be shorter than `length`.
     ///
-    /// The direction (`kUSBIn`, 0xC0) is already encoded in `request.requestType` and
-    /// passed through as `bmRequestType`.
+    /// Uses the timed `DeviceRequestTO` form (see `controlWrite`). The direction (`kUSBIn`,
+    /// 0xC0) is already encoded in `request.requestType` and passed through as `bmRequestType`.
     func controlRead(_ request: USBControlRequest, length: Int) async throws -> [UInt8] {
         guard length > 0 else { return [] }
 
         // Data-phase buffer; `pData` points into it and it must outlive the blocking call.
         var buffer = [UInt8](repeating: 0, count: length)
         let transferred: Int = try buffer.withUnsafeMutableBufferPointer { ptr in
-            var req = IOUSBDevRequest()
+            var req = IOUSBDevRequestTO()
             req.bmRequestType = request.requestType
             req.bRequest = request.request
             req.wValue = request.value
@@ -346,12 +355,12 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             req.wLength = UInt16(clamping: length)
             req.pData = UnsafeMutableRawPointer(ptr.baseAddress)
             req.wLenDone = 0
+            req.noDataTimeout = Self.controlTimeoutMs
+            req.completionTimeout = Self.controlTimeoutMs
 
-            let result = device.pointee!.pointee.DeviceRequest(device, &req)
+            let result = Self.deviceRequestTO(device, &req)
             guard result == kIOReturnSuccess else {
-                throw SDRError.usb(
-                    "control read (DeviceRequest) failed: \(Self.ioReturnDescription(result))"
-                )
+                throw SDRError.usb(result, "control read (DeviceRequestTO) failed")
             }
             // `wLenDone` is the actual data-phase length; clamp to the buffer for safety.
             return min(Int(req.wLenDone), ptr.count)
@@ -359,7 +368,21 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         return Array(buffer.prefix(transferred))
     }
 
-    // MARK: - USBTransport — bulk streaming (Task 3)
+    /// Issues a timed EP0 `DeviceRequestTO`. `DeviceRequestTO` lives on `IOUSBDeviceInterface182`,
+    /// not the base `IOUSBDeviceInterface` struct Swift binds `device` to — but the COM object we
+    /// actually queried is the `…942` interface, whose append-only v-table carries the `…182`
+    /// member at the same offset. Reinterpreting the handle as `IOUSBDeviceInterface182` for this
+    /// one call therefore stays in-bounds, exactly as the class-level COM-interop note describes.
+    private static func deviceRequestTO(
+        _ device: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>,
+        _ req: inout IOUSBDevRequestTO
+    ) -> IOReturn {
+        let device182 = UnsafeMutableRawPointer(device)
+            .assumingMemoryBound(to: UnsafeMutablePointer<IOUSBDeviceInterface182>?.self)
+        return device182.pointee!.pointee.DeviceRequestTO(device182, &req)
+    }
+
+    // MARK: - USBTransport — bulk streaming
 
     /// Continuous bulk-IN stream. Keeps `inFlight` `ReadPipeAsync` reads of `transferSize`
     /// bytes outstanding on the pipe for `endpoint`; each completion yields its bytes and
@@ -370,12 +393,15 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
     func bulkStream(
         endpoint: UInt8, transferSize: Int, inFlight: Int
     ) -> AsyncThrowingStream<[UInt8], Error> {
-        AsyncThrowingStream { continuation in
+        let depth = max(1, inFlight)
+        // Bound the buffer to the ring's in-flight depth. The transport can produce up to
+        // `depth` transfers before the async consumer next resumes; without a cap a stalled
+        // consumer would let this stream grow without limit (~4.8 MB/s at 2.4 MS/s).
+        return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(depth)) { continuation in
             guard transferSize > 0 else {
                 continuation.finish(throwing: SDRError.usb("bulkStream: transferSize must be > 0"))
                 return
             }
-            let depth = max(1, inFlight)
 
             // --- Locate the bulk-IN pipe ref for `endpoint` (0x81 = IN, endpoint number 1). ---
             let pipeRef: UInt8
@@ -391,20 +417,33 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
             let created = interface.pointee!.pointee.CreateInterfaceAsyncEventSource(interface, &sourceRef)
             guard created == kIOReturnSuccess, let sourceRef else {
                 continuation.finish(throwing: SDRError.usb(
-                    "bulkStream: CreateInterfaceAsyncEventSource failed: \(Self.ioReturnDescription(created))"
+                    created, "bulkStream: CreateInterfaceAsyncEventSource failed"
                 ))
                 return
             }
             // `CreateInterfaceAsyncEventSource` returns a +1 source; hand ownership to ARC.
             let source = sourceRef.takeRetainedValue()
 
+            // Chain this ring behind the previous one on the shared pipe: capture the prior
+            // ring's teardown signal to wait on, and publish this ring's for the next start.
+            let (previousTeardown, myTeardown) = ringLock.withLock {
+                () -> (DispatchSemaphore?, DispatchSemaphore) in
+                let prior = previousRingTeardown
+                let mine = DispatchSemaphore(value: 0)
+                previousRingTeardown = mine
+                return (prior, mine)
+            }
+
             let context = BulkReadContext(
+                transport: self,
                 interface: interface,
                 pipeRef: pipeRef,
                 transferSize: transferSize,
                 inFlight: depth,
                 source: source,
-                continuation: continuation
+                continuation: continuation,
+                waitForPreviousTeardown: previousTeardown,
+                signalTeardown: myTeardown
             )
             continuation.onTermination = { _ in context.stop() }
             context.start()
@@ -422,11 +461,14 @@ final class IOUSBLibTransport: USBTransport, @unchecked Sendable {
         var numEndpoints: UInt8 = 0
         let countResult = interface.pointee!.pointee.GetNumEndpoints(interface, &numEndpoints)
         guard countResult == kIOReturnSuccess else {
-            throw SDRError.usb("bulkStream: GetNumEndpoints failed: \(ioReturnDescription(countResult))")
+            throw SDRError.usb(countResult, "bulkStream: GetNumEndpoints failed")
+        }
+        guard numEndpoints > 0 else {
+            throw SDRError.usb("bulkStream: interface reports no endpoints")
         }
 
         // Pipe refs are 1-based; pipe ref 0 is the default control pipe (EP0).
-        for pipeRef in 1...max(1, numEndpoints) where pipeRef <= numEndpoints {
+        for pipeRef in 1...numEndpoints {
             var direction: UInt8 = 0
             var number: UInt8 = 0
             var transferType: UInt8 = 0
@@ -482,13 +524,31 @@ private func bulkReadCompletion(
 /// The TOCTOU discipline is "check `stopped` → submit"
 /// is made atomic with "flip `stopped` → abort" by holding `lock` across both, so no
 /// `ReadPipeAsync` is ever submitted after `AbortPipe`.
+///
+/// Lifetime: the context holds a strong `transport` reference for its whole life, so the
+/// IOUSBLib interface COM object cannot be `USBInterfaceClose`d / `Release`d out from under
+/// the ring thread while it is still servicing (possibly aborted) completions through that
+/// raw `interface` handle. It is released in `cleanup()`, after the last interface call.
+///
+/// Ordering: on the shared pipe, successive rings are serialised. Each ring blocks on the
+/// previous ring's `signalTeardown` before priming its own reads, and signals its own once
+/// `cleanup()` has run — so a restart's fresh reads never overlap the old ring's `AbortPipe`.
 private final class BulkReadContext: @unchecked Sendable {
+    /// Strong ref to the owning transport, guaranteeing the interface COM object outlives the
+    /// ring thread's use of `interface`. Released in `cleanup()`.
+    private var transport: IOUSBLibTransport?
     private let interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>
     private let pipeRef: UInt8
     private let transferSize: Int
     private let inFlight: Int
     private let source: CFRunLoopSource
     private let continuation: AsyncThrowingStream<[UInt8], Error>.Continuation
+    /// Signalled by the previous ring on this pipe once it has fully torn down; this ring waits
+    /// on it before priming so their `ReadPipeAsync`/`AbortPipe` never overlap. `nil` for the
+    /// first ring.
+    private let waitForPreviousTeardown: DispatchSemaphore?
+    /// Signalled by *this* ring's `cleanup()`, releasing whichever ring starts next.
+    private let signalTeardown: DispatchSemaphore
 
     private let lock = NSLock()
     /// Once true, no new reads are submitted and completions are dropped. Guarded by `lock`.
@@ -507,19 +567,25 @@ private final class BulkReadContext: @unchecked Sendable {
     private var outstanding = 0
 
     init(
+        transport: IOUSBLibTransport,
         interface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>,
         pipeRef: UInt8,
         transferSize: Int,
         inFlight: Int,
         source: CFRunLoopSource,
-        continuation: AsyncThrowingStream<[UInt8], Error>.Continuation
+        continuation: AsyncThrowingStream<[UInt8], Error>.Continuation,
+        waitForPreviousTeardown: DispatchSemaphore?,
+        signalTeardown: DispatchSemaphore
     ) {
+        self.transport = transport
         self.interface = interface
         self.pipeRef = pipeRef
         self.transferSize = transferSize
         self.inFlight = inFlight
         self.source = source
         self.continuation = continuation
+        self.waitForPreviousTeardown = waitForPreviousTeardown
+        self.signalTeardown = signalTeardown
     }
 
     /// Spawns the dedicated run-loop thread and starts servicing the ring.
@@ -535,9 +601,22 @@ private final class BulkReadContext: @unchecked Sendable {
     private func run() {
         let rl = CFRunLoopGetCurrent()!
 
+        // Wait for the previous ring on this shared pipe to fully abort and drain before doing
+        // ANYTHING — priming reads *or* tearing down. Placing the wait ahead of every path (the
+        // early-stopped path below included) keeps the teardown chain strictly transitive: this
+        // ring's `signalTeardown` in `cleanup()` can never fire before its predecessor's. Without
+        // that, a ring cancelled before it starts would signal immediately and release its
+        // successor while an earlier ring is still mid-`AbortPipe`, aborting the successor's fresh
+        // reads. Bounded (each predecessor's own drain is bounded) so a wedged predecessor can
+        // never hang the chain — it proceeds best-effort.
+        if let waitForPreviousTeardown {
+            _ = waitForPreviousTeardown.wait(timeout: .now() + 10)
+        }
+
         lock.lock()
         if stopped {
-            // `stop()` fired before the thread got going: skip running entirely.
+            // `stop()` fired before (or during) startup: tear down without priming. The wait
+            // above ran first, so this teardown signal stays ordered behind the predecessor's.
             lock.unlock()
             cleanup()
             return
@@ -546,7 +625,8 @@ private final class BulkReadContext: @unchecked Sendable {
         CFRunLoopAddSource(rl, source, .defaultMode)
         lock.unlock()
 
-        // Prime the ring with `inFlight` outstanding reads (each on its own heap buffer).
+        // Prime the ring with `inFlight` outstanding reads (each on its own heap buffer). `submit`
+        // re-checks `stopped` under `lock`, so a read never slips in after a concurrent abort.
         for _ in 0..<inFlight {
             let buffer = UnsafeMutableRawPointer.allocate(
                 byteCount: transferSize, alignment: MemoryLayout<UInt8>.alignment
@@ -615,9 +695,7 @@ private final class BulkReadContext: @unchecked Sendable {
         lock.unlock()
 
         if submitError != kIOReturnSuccess {
-            finish(with: SDRError.usb(
-                "bulkStream: ReadPipeAsync failed: \(IOUSBLibTransport.ioReturnDescription(submitError))"
-            ))
+            finish(with: SDRError.usb(submitError, "bulkStream: ReadPipeAsync failed"))
             return false
         }
         return true
@@ -653,14 +731,16 @@ private final class BulkReadContext: @unchecked Sendable {
             }
             submit(slot: slot)
         case kIOReturnAborted:
-            // Expected once `stop()`/`finish()` has aborted the pipe; drop silently.
-            return
-        case kIOReturnNoDevice, kIOReturnNotResponding, kIOReturnNotAttached:
-            finish(with: SDRError.deviceDisconnected)
+            // We reach here only when NOT stopped (the drain guard above handles the stopped
+            // case). An abort we did not initiate must not silently drain the ring to zero
+            // in-flight; re-submit to keep streaming. The strict start-ordering in `run()` (each
+            // ring waits for every predecessor's full teardown before priming) means a sibling
+            // ring's `AbortPipe` can no longer reach a live ring's reads, so this now guards only
+            // an unforeseen external abort of the pipe — defence in depth, not a routine path.
+            submit(slot: slot)
         default:
-            finish(with: SDRError.usb(
-                "bulkStream: read failed: \(IOUSBLibTransport.ioReturnDescription(result))"
-            ))
+            // Disconnect-class IOReturns are folded into `.deviceDisconnected` by `SDRError.usb`.
+            finish(with: SDRError.usb(result, "bulkStream: read failed"))
         }
     }
 
@@ -706,6 +786,9 @@ private final class BulkReadContext: @unchecked Sendable {
     /// drained (see `run()`'s drain loop): at this point no completion is pending or executing —
     /// they only run inside `CFRunLoopRunInMode` on this same thread, and `outstanding` is zero —
     /// so freeing the buffers and releasing the source is safe.
+    ///
+    /// Always signals `signalTeardown` (freeing the next ring on the shared pipe) and always
+    /// releases `transport` last, regardless of which teardown path ran.
     private func cleanup() {
         if let rl = runLoop {
             CFRunLoopRemoveSource(rl, source, .defaultMode)
@@ -717,10 +800,28 @@ private final class BulkReadContext: @unchecked Sendable {
         // already finished it; the continuation makes the second call a no-op).
         continuation.finish()
 
-        for slot in slots {
-            slot.buffer.deallocate()
+        // If the drain backstop expired with reads still outstanding, the kernel may still write
+        // into these buffers and deliver a late completion that dereferences these slots. Freeing
+        // (or dropping the slots) now would re-expose the very use-after-free the drain bounds, so
+        // deliberately leak them instead — strictly safer, and only reachable on the pathological
+        // path where a completion is never delivered. Otherwise free normally and break the
+        // context <-> slot cycle so both deallocate once this thread exits.
+        let readsStillOutstanding = lock.withLock { outstanding > 0 }
+        if readsStillOutstanding {
+            // Leak `slots` and their buffers: keep them alive for any late completion. The
+            // transport is still released below regardless — its `deinit`'s `USBInterfaceClose`
+            // aborts any wedged kernel I/O, and the leaked buffers keep a still-valid target for
+            // any stray DMA rather than freeing memory the kernel might yet write into.
+        } else {
+            for slot in slots {
+                slot.buffer.deallocate()
+            }
+            slots.removeAll()
         }
-        // Break the context <-> slot strong cycle so both deallocate once this thread exits.
-        slots.removeAll()
+
+        // Release the next ring on this pipe, then drop the transport (the last thing keeping the
+        // interface COM object alive from here).
+        signalTeardown.signal()
+        transport = nil
     }
 }

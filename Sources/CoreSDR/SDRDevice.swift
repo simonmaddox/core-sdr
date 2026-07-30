@@ -4,14 +4,25 @@ import IOKit
 /// an injectable `USBTransport`, forwarding tune/rate/gain configuration to
 /// an internal `RTLSDRDevice` and exposing IQ sample streaming.
 ///
-/// Actor isolation gives callers a single, serialized entry point per
-/// device: concurrent `tune(to:)`/`setGain(_:)`/`samples()` calls from
-/// multiple tasks are queued rather than racing on the underlying USB
-/// transport.
+/// Actor isolation alone is *not* enough to serialize the hardware-configuring
+/// calls: `SDRDevice` is a reentrant actor, so `tune(to:)`/`setGain(_:)`/
+/// `setSampleRate(_:)` from different tasks would interleave at their internal
+/// `await`s — corrupting the R820T2's I2C-repeater bracketing and register
+/// shadow. Those three calls are therefore funnelled through an explicit
+/// in-actor serial queue (`serialized(_:)`), so exactly one runs against the
+/// hardware at a time; the second waits for the first to finish rather than
+/// racing it. (Streaming setup — `samples()`/`stop()` — is independent: it
+/// touches the demodulator FIFO, not the tuner's repeater/shadow, so it is not
+/// part of that queue.)
 public actor SDRDevice {
     private let device: RTLSDRDevice
     private let info: SDRDeviceInfo
     private var streamTask: Task<Void, Never>?
+
+    /// Tail of the hardware-operation serial queue. Each configuring call chains
+    /// onto the previous one's completion (see `serialized(_:)`), so their USB
+    /// register sequences never interleave. Starts already-completed.
+    private var operationChain: Task<Void, Never> = Task {}
 
     /// Default bulk-transfer sizing for `samples()`: 16 KiB transfers, 4
     /// in flight, matching common `librtlsdr`-style client defaults.
@@ -45,17 +56,37 @@ public actor SDRDevice {
     /// Tunes the R820T2 PLL to `frequency`. Throws `SDRError.tuningOutOfRange`
     /// if `frequency` falls outside `capabilities.frequencyRange`.
     public func tune(to frequency: Frequency) async throws {
-        try await device.tune(to: frequency)
+        try await serialized { [device] in try await device.tune(to: frequency) }
     }
 
     /// Configures the demodulator resampler for `rate`.
     public func setSampleRate(_ rate: SampleRate) async throws {
-        try await device.setSampleRate(rate)
+        try await serialized { [device] in try await device.setSampleRate(rate) }
     }
 
     /// Sets automatic (AGC) or manual gain.
     public func setGain(_ gain: Gain) async throws {
-        try await device.setGain(gain)
+        try await serialized { [device] in try await device.setGain(gain) }
+    }
+
+    /// Runs `operation` after every previously-enqueued hardware operation has
+    /// finished, so the tuner's read-modify-write register sequences never
+    /// interleave under actor reentrancy. `operation` runs off the actor (it
+    /// only touches the `Sendable` `RTLSDRDevice` value), so awaiting it here
+    /// never blocks the next caller from enqueuing.
+    private func serialized<T: Sendable>(
+        _ operation: @Sendable @escaping () async throws -> T
+    ) async throws -> T {
+        let previous = operationChain
+        let operationTask = Task { () async throws -> T in
+            await previous.value
+            return try await operation()
+        }
+        // Publish this operation as the new tail *before* suspending, so a
+        // concurrent caller chains behind it. A failing operation must not break
+        // the chain, so the tail tracker swallows the error.
+        operationChain = Task { _ = try? await operationTask.value }
+        return try await operationTask.value
     }
 
     /// Starts streaming IQ samples and returns the stream. Cancels any
@@ -65,6 +96,14 @@ public actor SDRDevice {
     /// Uses sensible defaults for the underlying bulk transfer sizing
     /// (16384-byte transfers, 4 in flight). The active pump task is
     /// tracked so `stop()` can cancel it.
+    ///
+    /// A single pump drives the transport's bulk stream directly and stamps each
+    /// transfer into an `IQBlock` — the intermediate per-`RTLSDRDevice` stream is
+    /// gone, so a transfer crosses two `AsyncThrowingStream`s (bounded transport
+    /// ring → this `bufferingNewest(1)` stream) rather than three. Deterministic
+    /// restart ordering on the shared USB pipe is handled inside the transport,
+    /// so back-to-back `stop()` + `samples()` (or `samples()` + `samples()`)
+    /// cannot have the old ring's teardown starve the new one.
     public func samples() -> AsyncThrowingStream<IQBlock, Error> {
         streamTask?.cancel()
 
@@ -74,11 +113,14 @@ public actor SDRDevice {
         let device = self.device
         let task = Task {
             do {
-                for try await block in device.samples(
+                try await device.resetStreaming()
+                var sequence: UInt64 = 0
+                for try await chunk in device.bulkStream(
                     transferSize: Self.defaultTransferSize,
                     inFlight: Self.defaultInFlight
                 ) {
-                    continuation.yield(block)
+                    continuation.yield(device.makeBlock(raw: chunk, sequence: sequence))
+                    sequence += 1
                 }
                 continuation.finish()
             } catch {

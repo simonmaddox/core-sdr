@@ -95,50 +95,38 @@ struct RTLSDRDevice {
 }
 
 extension RTLSDRDevice {
-    /// Streams live IQ samples from the dongle's bulk endpoint (0x81).
-    ///
-    /// Resets the USB buffer, then bridges `transport.bulkStream` into
-    /// `IQBlock`s stamped with the current `centerFrequency`/`sampleRate`
-    /// (as last set by `tune(to:)`/`setSampleRate(_:)`), a monotonic
-    /// per-transfer `sequence` (so dropped/gapped transfers are observable),
-    /// and a `mach_absolute_time()` host timestamp.
-    ///
-    /// Backpressure is drop-on-slow: the returned stream is built with
-    /// `.bufferingNewest(1)`, so a consumer that falls behind live RF drops
-    /// whole blocks (keeping only the newest) rather than accumulating lag.
-    ///
-    /// Cancelling the consuming task, or otherwise terminating iteration,
-    /// stops the underlying bulk transfer stream.
-    func samples(transferSize: Int, inFlight: Int) -> AsyncThrowingStream<IQBlock, Error> {
-        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let pump = Task {
-                do {
-                    try await rtl.resetBuffer()
-                    var sequence: UInt64 = 0
-                    let upstream = rtl.transport.bulkStream(
-                        endpoint: 0x81,
-                        transferSize: transferSize,
-                        inFlight: inFlight
-                    )
-                    for try await chunk in upstream {
-                        let block = IQBlock(
-                            raw: chunk,
-                            sampleRate: tuningState.sampleRate,
-                            centerFrequency: tuningState.centerFrequency,
-                            sequence: sequence,
-                            hostTimestamp: mach_absolute_time()
-                        )
-                        sequence += 1
-                        continuation.yield(block)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                pump.cancel()
-            }
-        }
+    /// Streaming primitives for the dongle's bulk endpoint (0x81). These are the
+    /// decomposed pieces of a single sample pump: the owning `SDRDevice` drives
+    /// them from one task (reset → iterate `bulkStream` → `makeBlock`), so blocks
+    /// are not re-pumped through a redundant intermediate stream.
+
+    /// Resets the demodulator's USB FIFO in preparation for a fresh stream.
+    func resetStreaming() async throws {
+        try await rtl.resetBuffer()
+    }
+
+    /// The raw bulk-IN transfer stream from endpoint 0x81. Each element is one
+    /// transfer's bytes. Backpressure is bounded and drop-on-slow inside the
+    /// transport (buffering capped to the in-flight ring depth). Cancelling the
+    /// consuming task, or otherwise terminating iteration, stops the transfers.
+    func bulkStream(transferSize: Int, inFlight: Int) -> AsyncThrowingStream<[UInt8], Error> {
+        rtl.transport.bulkStream(endpoint: 0x81, transferSize: transferSize, inFlight: inFlight)
+    }
+
+    /// Stamps one bulk transfer into an `IQBlock` with the current
+    /// `centerFrequency`/`sampleRate` (as last set by `tune(to:)`/
+    /// `setSampleRate(_:)`), a monotonic per-transfer `sequence`, and a
+    /// `mach_absolute_time()` host timestamp. The sequence makes drops *after*
+    /// stamping observable (a slow consumer skipping delivered blocks); note it
+    /// cannot reveal transfers the bounded transport ring dropped *before*
+    /// stamping, which are never assigned a sequence.
+    func makeBlock(raw: [UInt8], sequence: UInt64) -> IQBlock {
+        IQBlock(
+            raw: raw,
+            sampleRate: tuningState.sampleRate,
+            centerFrequency: tuningState.centerFrequency,
+            sequence: sequence,
+            hostTimestamp: mach_absolute_time()
+        )
     }
 }
