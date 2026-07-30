@@ -169,7 +169,21 @@ extension MockUSBTransport {
     /// (`vco_fine_tune = 2`). FIFO order matters: the 5-byte `vco_fine_tune` read is
     /// consumed first, then the 3-byte PLL-lock read.
     func stubTunerPLLLocked() {
-        stubRead(value: 0x34, index: 0x0600, returns: [0x00, 0x00, 0x02, 0x00, 0x04]) // 5-byte: reg4→vco_fine_tune=2
-        stubRead(value: 0x34, index: 0x0600, returns: [0x00, 0x00, 0x02])             // 3-byte: reg2→locked
+        stubTunerPLLLocked(vcoFineTune: 2)
+    }
+
+    /// As `stubTunerPLLLocked()`, but for an arbitrary `vcoFineTune` (0...3), so
+    /// tests can drive the `div_num` nudge branches setFrequency takes when the
+    /// live status read disagrees with `vco_power_ref` (2): `vcoFineTune < 2`
+    /// nudges `div_num` up, `> 2` nudges it down. The reg4 wire byte is derived
+    /// by bit-reversing the post-reversal value the driver must observe
+    /// (`(vcoFineTune << 4) & 0x30`), since the mock serves pre-bit-reversal
+    /// wire bytes; reg2 stays wire `0x02` (post-reversal `0x40`, PLL locked).
+    /// FIFO order matches the driver: the 5-byte status read first, then the
+    /// 3-byte PLL-lock read.
+    func stubTunerPLLLocked(vcoFineTune: UInt8) {
+        let wireReg4 = R820T2.bitReverse((vcoFineTune << 4) & 0x30)
+        stubRead(value: 0x34, index: 0x0600, returns: [0x00, 0x00, 0x02, 0x00, wireReg4]) // 5-byte: reg4→vco_fine_tune
+        stubRead(value: 0x34, index: 0x0600, returns: [0x00, 0x00, 0x02])                 // 3-byte: reg2→locked
     }
 }

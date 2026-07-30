@@ -1,3 +1,5 @@
+import Foundation
+
 /// Register-level access to the R820T2 tuner, which sits on an I2C bus
 /// behind the RTL2832U. Tuner register writes are issued as USB control
 /// transfers on the RTL2832U's IICB block (`.i2c`), addressed to the
@@ -9,6 +11,44 @@
 /// Because the RTL2832U's I2C master is normally reserved for its own
 /// demodulator-side use, tuner access must be bracketed by toggling the
 /// demodulator's "I2C repeater" bit, mirroring `rtlsdr_set_i2c_repeater`.
+
+/// Persistent tuner register state: the software mirror of the reference
+/// driver's `priv->regs` (the register shadow every `r82xx_set_*` routine
+/// read-modify-writes against) and `priv->last_vco_curr` (the last VCO-current
+/// code programmed into reg 0x12). The reference carries both across calls
+/// rather than rebuilding them per operation, so a retune reads back the
+/// register state the previous tune actually left in the chip.
+///
+/// Held by reference so the `let`-stored `R820T2` value type can mutate it in
+/// place, mirroring the `TuningState` holder `RTLSDRDevice` uses for the same
+/// reason.
+///
+/// `@unchecked Sendable`: the compiler can't verify the manual locking, so all
+/// property access goes through `lock`. The read-modify-write register
+/// sequences that thread this state are serialized by the owning `SDRDevice`
+/// actor, matching the single-caller assumption the reference driver makes of
+/// `priv->regs`.
+private final class TunerRegisterState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _shadow: [UInt8]
+    private var _lastVcoCurr: UInt8
+
+    init(shadow: [UInt8], lastVcoCurr: UInt8) {
+        _shadow = shadow
+        _lastVcoCurr = lastVcoCurr
+    }
+
+    var shadow: [UInt8] {
+        get { lock.withLock { _shadow } }
+        set { lock.withLock { _shadow = newValue } }
+    }
+
+    var lastVcoCurr: UInt8 {
+        get { lock.withLock { _lastVcoCurr } }
+        set { lock.withLock { _lastVcoCurr = newValue } }
+    }
+}
+
 struct R820T2 {
     /// Fixed I2C address of the R820T2 tuner on the RTL2832U's I2C bus.
     static let i2cAddress: UInt16 = 0x34
@@ -35,6 +75,14 @@ struct R820T2 {
     ]
 
     private let rtl: RTL2832U
+
+    /// Live register shadow + last-VCO-current code, seeded to the post-`init`
+    /// state and then persisted across every tune/gain call (see `setFrequency`
+    /// and `TunerRegisterState`).
+    private let state = TunerRegisterState(
+        shadow: R820T2.postInitShadow(),
+        lastVcoCurr: R820T2.postInitVcoCurr
+    )
 
     init(rtl: RTL2832U) {
         self.rtl = rtl
@@ -81,6 +129,18 @@ struct R820T2 {
     func readRegisters(count: Int) async throws -> [UInt8] {
         let request = RTLRegisters.readRequest(block: .i2c, addr: Self.i2cAddress)
         let raw = try await rtl.transport.controlRead(request, length: count)
+        // `controlRead` is documented to return possibly fewer bytes than
+        // requested (a short EP0 read from a flaky dongle or a mid-transfer
+        // hot-unplug), and the PLL routines index fixed offsets into the
+        // result. A truncated read must surface as a thrown error, not an
+        // out-of-bounds trap on the caller's `data[i]`. Validating here covers
+        // every read site (there is no other path into `controlRead` from the
+        // tuner). No dedicated `SDRError` case exists for a short control read,
+        // so it is reported as `.usb`.
+        guard raw.count >= count else {
+            throw SDRError.usb(
+                "tuner register read returned \(raw.count) of \(count) requested bytes")
+        }
         return raw.prefix(count).map { Self.bitReverse($0) }
     }
 
@@ -170,26 +230,43 @@ struct R820T2 {
     /// Tunes the tuner PLL to `hz`, reproducing the reference
     /// `r82xx_set_freq64` -> `r82xx_set_mux` + `r82xx_set_pll` write sequence.
     ///
-    /// This models a freshly-initialised R820T (matching the golden capture,
-    /// which re-runs `r82xx_init` before each vector): the register shadow
-    /// starts at `postInitShadow()`, and it targets the non-V4, no-harmonic,
-    /// lower-sideband case (`nth_harm = 0`, `sideband = 0`), so the LO
-    /// frequency is `hz + intFreq`. Chip status registers are read live over
-    /// USB (`readRegisters`), driving `vco_fine_tune` (the `div_num` nudge and
-    /// its 0x10 write) and the PLL-lock retry (which can emit an extra 0x12
-    /// VCO-current write), exactly as the reference does. All register writes
-    /// are bracketed by the I2C repeater, as the reference driver does at the
-    /// `rtlsdr` layer.
+    /// The register shadow and `last_vco_curr` are loaded from the persistent
+    /// `state` and written back after the tune, so successive tunes read-modify-
+    /// write against the state the previous tune actually left in the chip —
+    /// matching the reference's persistent `priv->regs` / `priv->last_vco_curr`
+    /// (which it does *not* rebuild per call). `state` is seeded to
+    /// `postInitShadow()` / `postInitVcoCurr`, so the *first* tune from a fresh
+    /// tuner reproduces the golden capture (whose harness re-ran `r82xx_init`
+    /// before each vector); a *retune* legitimately diverges from a fresh-init
+    /// sequence, e.g. the pre-`div_num`-write copies of reg 0x10 now carry the
+    /// previous tune's `div_num` rather than the post-init default.
+    ///
+    /// This targets the non-V4, no-harmonic, lower-sideband case
+    /// (`nth_harm = 0`, `sideband = 0`), so the LO frequency is `hz + intFreq`.
+    /// Chip status registers are read live over USB (`readRegisters`), driving
+    /// `vco_fine_tune` (the `div_num` nudge and its 0x10 write) and the
+    /// PLL-lock retry (which can emit an extra 0x12 VCO-current write), exactly
+    /// as the reference does. All register writes are bracketed by the I2C
+    /// repeater, as the reference driver does at the `rtlsdr` layer.
+    ///
+    /// The shadow is written back via `defer` so a fault mid-sequence still
+    /// persists the registers already programmed, keeping the shadow a faithful
+    /// mirror of the chip for the next call.
     func setFrequency(_ hz: UInt64, xtal: UInt32 = 28_800_000) async throws {
-        var shadow = Self.postInitShadow()
-        var lastVcoCurr = Self.postInitVcoCurr
+        var shadow = state.shadow
+        var lastVcoCurr = state.lastVcoCurr
+        defer {
+            state.shadow = shadow
+            state.lastVcoCurr = lastVcoCurr
+        }
 
         // r82xx_set_freq64: sideband 0, tuner_harmonic 0 -> LO is additive.
         let loFreq = hz + Self.intFreq // + if_band_center_freq (0)
 
         try await setRepeater(enabled: true)
         try await setMux(loFreq: loFreq, shadow: &shadow)
-        try await setPLL(loFreq: loFreq, xtal: xtal, shadow: &shadow, lastVcoCurr: &lastVcoCurr)
+        try await setPLL(loFreq: loFreq, requestedHz: hz, xtal: xtal,
+                         shadow: &shadow, lastVcoCurr: &lastVcoCurr)
         try await setRepeater(enabled: false)
     }
 
@@ -244,7 +321,7 @@ struct R820T2 {
     /// fractional `sdm`, and the register writes to 0x10/0x1a/0x14/0x12/0x16/
     /// 0x15/0x1a. Chip reads are modelled from the harness's deterministic
     /// image (`vco_fine_tune = 2`, PLL locked).
-    private func setPLL(loFreq: UInt64, xtal: UInt32,
+    private func setPLL(loFreq: UInt64, requestedHz: UInt64, xtal: UInt32,
                         shadow: inout [UInt8], lastVcoCurr: inout UInt8) async throws {
         let vcoMin: UInt64 = 1_770_000            // kHz
         let vcoMax: UInt64 = vcoMin * 2           // kHz (vco_algo == 0)
@@ -289,8 +366,18 @@ struct R820T2 {
             divNum += 1
         }
 
-        // div_num into R16[7:5].
-        try await writeRegisterMask(0x10, UInt8(divNum) << 5, mask: 0xe0, shadow: &shadow)
+        // div_num into R16[7:5]. The reference computes `div_num << 5` on a
+        // signed `int` and masks with 0xe0. When the `vco_fine_tune` nudge
+        // drives div_num to -1 — reachable whenever mix_div == 2 (LO >= 885 MHz,
+        // i.e. tunes from ~881.5 MHz, well inside the advertised range) and the
+        // live status read reports `vco_fine_tune == 3` — that C expression
+        // wraps `(-1 << 5) & 0xe0` to 0xe0, programming div_num = 7: a divider
+        // the band search never selects. We clamp to the valid 0...7 range
+        // instead, saturating an out-of-range nudge to the nearest real divider
+        // rather than reproducing the reference's signed-shift artifact (which
+        // would also trap here as `UInt8(-1)`).
+        let clampedDivNum = min(max(divNum, 0), 7)
+        try await writeRegisterMask(0x10, UInt8(clampedDivNum) << 5, mask: 0xe0, shadow: &shadow)
 
         // Approximate vco_freq / (2 * pll_ref) as nint + sdm/65536.
         let vcoFreq = loFreq * mixDiv
@@ -298,9 +385,10 @@ struct R820T2 {
         let nint = UInt32(vcoDiv / 65536)
         let sdm = UInt32(vcoDiv % 65536)
 
-        // nint must fit; guaranteed for the supported band.
+        // nint must fit; guaranteed for the supported band. Report the user's
+        // requested RF frequency, not the internal LO (requested + IF offset).
         guard nint <= (128 / UInt32(vcoPowerRef)) - 1 else {
-            throw SDRError.tuningOutOfRange(Frequency(hertz: loFreq))
+            throw SDRError.tuningOutOfRange(Frequency(hertz: requestedHz))
         }
 
         let ni = (nint - 13) / 4
@@ -328,7 +416,8 @@ struct R820T2 {
             }
         }
         guard (lockData[2] & 0x40) != 0 else {
-            throw SDRError.tuningOutOfRange(Frequency(hertz: loFreq))
+            // Report the user's requested RF frequency, not the internal LO.
+            throw SDRError.tuningOutOfRange(Frequency(hertz: requestedHz))
         }
 
         // PLL autotune = 8 kHz (R26[3]).
@@ -433,13 +522,18 @@ struct R820T2 {
     /// Sets a fixed manual LNA+mixer gain, reproducing the reference
     /// `r82xx_set_gain(set_manual_gain = 1)` write sequence: disable LNA/mixer
     /// AGC, derive the LNA/mixer indices from `tenthsDb` via the ported step
-    /// tables, program them, then set the VGA. Models a freshly-initialised
-    /// tuner (the golden capture re-runs `r82xx_init` before each vector), so
-    /// the masked writes RMW against `postInitShadow()`. The reference's dead
-    /// 4-byte chip read (its result is unused) is performed for fidelity. All
-    /// writes are bracketed by the I2C repeater, as the reference driver does.
+    /// tables, program them, then set the VGA. The masked writes RMW against —
+    /// and persist back to — the shared register shadow (`priv->regs`), so from
+    /// a freshly-initialised tuner they reproduce the golden capture (whose
+    /// harness re-ran `r82xx_init` before each vector), while the gain registers
+    /// (0x05/0x07/0x0c) they touch are disjoint from the tuning registers, so
+    /// interleaving with `setFrequency` leaves both sequences faithful. The
+    /// reference's dead 4-byte chip read (its result is unused) is performed for
+    /// fidelity. All writes are bracketed by the I2C repeater, as the reference
+    /// driver does.
     func setManualGain(tenthsDb: Int) async throws {
-        var shadow = Self.postInitShadow()
+        var shadow = state.shadow
+        defer { state.shadow = shadow }
         let (lnaIndex, mixerIndex) = Self.rfGainIndex(tenthsDb: tenthsDb)
 
         try await setRepeater(enabled: true)
@@ -461,9 +555,11 @@ struct R820T2 {
     /// Enables LNA/mixer AGC, reproducing the reference
     /// `r82xx_set_gain(set_manual_gain = 0)` write sequence: turn LNA and mixer
     /// auto control on, then set the VGA. As with `setManualGain`, masked writes
-    /// RMW against `postInitShadow()` and are bracketed by the I2C repeater.
+    /// RMW against — and persist back to — the shared register shadow, and are
+    /// bracketed by the I2C repeater.
     func setAutomaticGain() async throws {
-        var shadow = Self.postInitShadow()
+        var shadow = state.shadow
+        defer { state.shadow = shadow }
 
         try await setRepeater(enabled: true)
         // LNA auto on == AGC (R5[4] = 0).
