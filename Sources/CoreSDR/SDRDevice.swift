@@ -100,7 +100,13 @@ public actor SDRDevice {
     /// A single pump drives the transport's bulk stream directly and stamps each
     /// transfer into an `IQBlock` — the intermediate per-`RTLSDRDevice` stream is
     /// gone, so a transfer crosses two `AsyncThrowingStream`s (bounded transport
-    /// ring → this `bufferingNewest(1)` stream) rather than three. Deterministic
+    /// ring → this `bufferingNewest(16)` stream) rather than three. The 16-deep
+    /// buffer (~55 ms at 2.4 MS/s) absorbs the bursts the `inFlight` USB
+    /// transfers complete in — with a 1-deep buffer even a tight consumer lost
+    /// ~1% of blocks to burst overwrites, which audio consumers hear as
+    /// crackle. Sustained-overload behaviour is unchanged: latest wins, oldest
+    /// buffered block is dropped first, and `IQBlock.sequence` still exposes
+    /// every gap. Deterministic
     /// restart ordering on the shared USB pipe is handled inside the transport,
     /// so back-to-back `stop()` + `samples()` (or `samples()` + `samples()`)
     /// cannot have the old ring's teardown starve the new one.
@@ -108,7 +114,7 @@ public actor SDRDevice {
         streamTask?.cancel()
 
         let (stream, continuation) = AsyncThrowingStream<IQBlock, Error>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
+            bufferingPolicy: .bufferingNewest(16)
         )
         let device = self.device
         let task = Task {
