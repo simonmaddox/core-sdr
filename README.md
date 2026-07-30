@@ -37,7 +37,7 @@ Add CoreSDR via Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.1.1"),
+    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.2.0"),
 ]
 ```
 
