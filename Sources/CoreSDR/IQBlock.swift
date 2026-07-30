@@ -32,13 +32,12 @@ public struct IQBlock: Sendable {
         let count = raw.count
         guard count > 0 else { return [] }
 
-        var floats = [Float](repeating: 0, count: count)
-        vDSP_vfltu8(raw, 1, &floats, 1, vDSP_Length(count))
-
         var result = [Float](repeating: 0, count: count)
+        vDSP_vfltu8(raw, 1, &result, 1, vDSP_Length(count))
+
         var scale: Float = 1.0 / 127.5
         var offset: Float = -127.5 / 127.5
-        vDSP_vsmsa(floats, 1, &scale, &offset, &result, 1, vDSP_Length(count))
+        vDSP_vsmsa(result, 1, &scale, &offset, &result, 1, vDSP_Length(count))
         return result
     }
 }

@@ -37,7 +37,7 @@ Add CoreSDR via Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.1.0"),
+    .package(url: "https://github.com/simonmaddox/core-sdr.git", from: "1.1.1"),
 ]
 ```
 
@@ -79,7 +79,9 @@ await radio.stop()
 
 `SDRDevice` is a Swift actor, so `tune(to:)`, `setSampleRate(_:)`,
 `setGain(_:)`, and `samples()` are all `async`. Reopen a specific device
-later (by its stable `SDRDeviceInfo.id`) with `SDRDevice.open(_:)`.
+later (by its `SDRDeviceInfo.id`, stable only while the device stays
+attached — it's an IORegistry entry ID, which changes on every replug) with
+`SDRDevice.open(_:)`.
 
 The stream drops whole blocks rather than buffering unboundedly if your
 consumer falls behind — SDR is real-time, and `IQBlock.sequence` is
