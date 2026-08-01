@@ -3,6 +3,7 @@ import Testing
 
 @Test func setIFFrequencyEmitsThreeDemodWrites() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     let rtl = RTL2832U(transport: m)
     try await rtl.setIFFrequency(3_570_000)
 
@@ -21,6 +22,7 @@ import Testing
 
 @Test func configureForR820T2EmitsFourWritesInOrder() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     let rtl = RTL2832U(transport: m)
     try await rtl.configureForR820T2()
 
@@ -46,6 +48,7 @@ import Testing
 
 @Test func openConfiguresR820T2AfterBasebandAndTunerInit() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     let dev = RTLSDRDevice(transport: m)
     try await dev.open()
     let w = m.controlWrites

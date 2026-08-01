@@ -3,6 +3,7 @@ import Testing
 
 @Test func openInitializesBasebandThenTuner() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     let dev = RTLSDRDevice(transport: m)
     try await dev.open()
     // baseband USB_SYSCTL write happens before any IICB tuner write

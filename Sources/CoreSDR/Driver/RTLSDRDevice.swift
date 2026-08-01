@@ -51,6 +51,10 @@ struct RTLSDRDevice {
     /// demodulator, so baseband init must complete first.
     func open() async throws {
         try await rtl.initBaseband()
+        // Refuse-with-a-reason before touching tuner registers: a V4's R828D
+        // (same USB IDs) or an older FC001x/E4000 stick must surface as
+        // `SDRError.unsupportedTuner`, not a cryptic init failure downstream.
+        try await tuner.verifySupportedTuner()
         try await tuner.initialize()
         // The R820T2 delivers a 3.57 MHz low-IF; switch the demod out of the
         // zero-IF config `initBaseband` leaves it in and program the digital

@@ -57,6 +57,15 @@ final class MockUSBTransport: USBTransport, @unchecked Sendable {
         withLock { readStubs[key, default: []].append(returns) }
     }
 
+    /// Answers `RTLSDRDevice.open()`'s tuner chip-ID probe as a present
+    /// R820T2 (raw wire byte `0x96` = bit-reversed `0x69`), so tests that
+    /// exercise the happy-path open sequence don't each re-derive the I2C
+    /// read encoding. Un-stubbed probes read zero-fill, which the probe
+    /// correctly treats as "no supported tuner".
+    func stubR820T2Present() {
+        stubRead(value: R820T2.i2cAddress, index: UInt16(RTLBlock.i2c.rawValue) << 8, returns: [0x96])
+    }
+
     /// Queue the chunks `bulkStream` will yield, one element per array
     /// supplied, in order.
     func stubBulk(_ chunks: [[UInt8]]) {

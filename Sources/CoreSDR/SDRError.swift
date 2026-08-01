@@ -13,6 +13,15 @@ public enum SDRError: Error, Sendable {
     case tuningOutOfRange(Frequency)
     case unsupportedSampleRate(SampleRate)
     case deviceDisconnected
+    /// The dongle's RTL2832U enumerated fine but its tuner is not the
+    /// supported R820T2 — e.g. an RTL-SDR Blog V4, whose R828D shares the
+    /// RTL2832U's USB IDs and is indistinguishable until the tuner I2C
+    /// probe. `detected` names the tuner when identified ("R828D"), `nil`
+    /// when nothing recognisable answered (FC0012/FC0013/E4000-era sticks).
+    /// Deliberately a distinct case (not `.usb`) so apps can show an honest
+    /// "this dongle isn't supported yet" instead of a cryptic USB error —
+    /// and skip reconnect loops that can never succeed.
+    case unsupportedTuner(detected: String?)
     /// A USB-level failure. `code` is the raw IOKit `IOReturn` (or an HRESULT
     /// from a COM `QueryInterface`); `message` is a human-readable description
     /// that already embeds the code in hex.

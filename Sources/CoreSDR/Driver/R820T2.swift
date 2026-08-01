@@ -53,6 +53,15 @@ struct R820T2 {
     /// Fixed I2C address of the R820T2 tuner on the RTL2832U's I2C bus.
     static let i2cAddress: UInt16 = 0x34
 
+    /// I2C address of the R828D (RTL-SDR Blog V4 and friends) — probed only
+    /// to *name* an unsupported tuner in `SDRError.unsupportedTuner`; no
+    /// R828D support is implied.
+    static let r828dI2CAddress: UInt16 = 0x74
+
+    /// Chip-ID byte the R820T/R828D family answers at register 0x00
+    /// (`R82XX_CHECK_VAL` in the reference driver).
+    static let chipID: UInt8 = 0x69
+
     /// Maximum payload of a single IICB control transfer, in bytes, including
     /// the leading register-address byte. The RTL2832U's I2C block write
     /// accepts at most 16 bytes per transfer; the device STALLs the control
@@ -151,6 +160,49 @@ struct R820T2 {
         try await setRepeater(enabled: true)
         try await writeRegisters(startReg: 0x05, Self.initArray)
         try await setRepeater(enabled: false)
+    }
+
+    /// Confirms an R820T2 actually answers on the I2C bus before `initialize`
+    /// programs it blind. An RTL-SDR Blog V4's R828D shares the RTL2832U's
+    /// USB IDs, so without this probe an unsupported dongle enumerates,
+    /// half-initialises, and fails with a cryptic USB error. Throws
+    /// `SDRError.unsupportedTuner` (naming the R828D when it answers at its
+    /// own address 0x74) so apps can say something honest instead.
+    ///
+    /// Probe protocol: set the register pointer to 0x00, read one byte, and
+    /// accept the family chip ID `0x69` in either bit order — the reference
+    /// driver's addressed probe (`rtlsdr_i2c_read_reg`) compares the raw
+    /// byte, while its bulk read path (`r82xx_read`) bit-reverses; accepting
+    /// both makes the check robust to which framing the chip uses. A NAK
+    /// surfaces as a thrown (stalled) control transfer → "not present".
+    /// The repeater is re-disabled on every path, including the throwing one.
+    func verifySupportedTuner() async throws {
+        try await setRepeater(enabled: true)
+        let r820t2Present = await Self.probeChipID(rtl: rtl, address: Self.i2cAddress)
+        let r828dPresent = r820t2Present
+            ? false
+            : await Self.probeChipID(rtl: rtl, address: Self.r828dI2CAddress)
+        try await setRepeater(enabled: false)
+        guard r820t2Present else {
+            throw SDRError.unsupportedTuner(detected: r828dPresent ? "R828D" : nil)
+        }
+    }
+
+    /// One addressed chip-ID probe: write the register pointer (0x00), read a
+    /// byte, compare against `chipID` in both bit orders. Any USB/I2C failure
+    /// (a NAK from an empty address stalls the control pipe) means "nothing
+    /// there" rather than an error worth surfacing.
+    private static func probeChipID(rtl: RTL2832U, address: UInt16) async -> Bool {
+        do {
+            try await rtl.transport.controlWrite(
+                RTLRegisters.writeRequest(block: .i2c, addr: address), data: [0x00])
+            let raw = try await rtl.transport.controlRead(
+                RTLRegisters.readRequest(block: .i2c, addr: address), length: 1)
+            guard let byte = raw.first else { return false }
+            return byte == Self.chipID || byte == Self.bitReverse(Self.chipID)
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Frequency (PLL) tuning

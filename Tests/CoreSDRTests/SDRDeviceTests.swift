@@ -3,6 +3,7 @@ import Testing
 
 @Test func actorTunesThroughTransport() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
     try await dev.open()
@@ -23,6 +24,7 @@ import Testing
 /// does, making the assertion pass even against a no-op `stop()`.)
 @Test func stopEndsActiveSampleStream() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubBulkRepeating([1, 2, 3, 4])
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
@@ -57,6 +59,7 @@ import Testing
 /// stub, so the lock check throws); the second, with a stub, must still succeed.
 @Test func failedOperationDoesNotBreakSerialChain() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
     try await dev.open()
 
@@ -76,6 +79,7 @@ import Testing
 /// would nest them (E,E,…), disabling the repeater mid-tune.
 @Test func concurrentTunesDoNotInterleaveRepeaterBrackets() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubTunerPLLLocked()
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
@@ -106,6 +110,7 @@ import Testing
 /// regression is covered by the hardware-gated `streamStopRestartDoesNotCrash`.
 @Test func backToBackSamplesRestartYieldsOnFreshStream() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubBulkRepeating([1, 2, 3, 4])
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
@@ -129,6 +134,7 @@ import Testing
 /// monotonic sequence and the live center frequency.
 @Test func samplesStampSequenceAndCenterFrequency() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubBulkRepeating([10, 20, 30, 40])
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
@@ -152,6 +158,7 @@ import Testing
 
 @Test func samplesAfterStopStartsFreshStream() async throws {
     let m = MockUSBTransport()
+    m.stubR820T2Present()
     m.stubBulkRepeating([1, 2, 3, 4])
     m.stubTunerPLLLocked()
     let dev = SDRDevice(transport: m, info: .init(id: "x", name: "RTL", serial: nil))
